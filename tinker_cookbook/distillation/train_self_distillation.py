@@ -111,7 +111,7 @@ async def incorporate_self_distillation_kl(
         generated_token_counts.append(len(generated_tokens))
         
         # Construct full sequence: proxy_prefix + generated_tokens_only
-        full_sequence = proxy_input.append_ints(generated_tokens)
+        full_sequence = tinker.ModelInput.from_ints(proxy_input.to_ints() + generated_tokens)
         proxy_teacher_sequences.append(full_sequence)
     
     # Compute proxy teacher logprobs for all sequences
@@ -203,9 +203,13 @@ class Config:
     base_url: str | None = None
     enable_trace: bool = False
 
-    eval_every: int = 20
-    save_every: int = 20
+    eval_every: int = 50
+    save_every: int = 50
+    infrequent_eval_every: int = 50
+    infrequent_evaluator_builders: list[SamplingClientEvaluatorBuilder] = chz.field(default_factory=list)
     load_checkpoint_path: str | None = None
+    load_optimizer_state: bool = True  # If False, only load weights (not optimizer state)
+    max_steps: int | None = None  # If None, train on full dataset
 
 
 @scope
@@ -309,6 +313,7 @@ async def do_sync_training(
     cfg: Config,
     training_client: tinker.TrainingClient,
     evaluators: list[SamplingClientEvaluator],
+    infrequent_evaluators: list[SamplingClientEvaluator],
     dataset: SelfDistillationDataset,
     ml_logger: ml_log.Logger,
     tokenizer: Tokenizer,
@@ -333,6 +338,13 @@ async def do_sync_training(
         if cfg.eval_every > 0 and i_batch % cfg.eval_every == 0:
             with timed("run_evals", metrics):
                 for evaluator in evaluators:
+                    eval_metrics = await evaluator(sampling_client)
+                    metrics.update({f"test/{k}": v for k, v in eval_metrics.items()})
+
+        # Run infrequent evaluations (e.g., AIME24, AIME25)
+        if cfg.infrequent_eval_every > 0 and i_batch % cfg.infrequent_eval_every == 0:
+            with timed("run_infrequent_evals", metrics):
+                for evaluator in infrequent_evaluators:
                     eval_metrics = await evaluator(sampling_client)
                     metrics.update({f"test/{k}": v for k, v in eval_metrics.items()})
 
@@ -421,7 +433,12 @@ async def main(cfg: Config):
         resume_info["state_path"] if resume_info else cfg.load_checkpoint_path
     )
     if load_state_path:
-        future = await training_client.load_state_with_optimizer_async(load_state_path)
+        if cfg.load_optimizer_state:
+            future = await training_client.load_state_with_optimizer_async(load_state_path)
+            logger.info(f"Loading state WITH optimizer from {load_state_path}")
+        else:
+            future = await training_client.load_state_async(load_state_path)
+            logger.info(f"Loading state WITHOUT optimizer from {load_state_path}")
         _ = await future.result_async()
         logger.info(f"Loaded state from {load_state_path}")
 
@@ -436,15 +453,23 @@ async def main(cfg: Config):
 
     # Create evaluators
     evaluators = [evaluator() for evaluator in cfg.evaluator_builders]
+    infrequent_evaluators = [evaluator() for evaluator in cfg.infrequent_evaluator_builders]
+
+    # Compute end_batch (respect max_steps if set)
+    end_batch = num_batches
+    if cfg.max_steps is not None:
+        end_batch = min(num_batches, cfg.max_steps)
+        logger.info(f"max_steps={cfg.max_steps}, will train for {end_batch - start_batch} steps")
 
     # Training loop
     await do_sync_training(
         start_batch=start_batch,
-        end_batch=num_batches,
+        end_batch=end_batch,
         num_batches=num_batches,
         cfg=cfg,
         training_client=training_client,
         evaluators=evaluators,
+        infrequent_evaluators=infrequent_evaluators,
         dataset=dataset,
         ml_logger=ml_logger,
         tokenizer=tokenizer,

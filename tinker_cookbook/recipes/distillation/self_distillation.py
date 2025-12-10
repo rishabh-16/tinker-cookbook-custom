@@ -28,6 +28,7 @@ from tinker_cookbook.distillation.self_distillation_datasets import (
     DEFAULT_STUDENT_SUFFIX,
     DEFAULT_PROXY_TEACHER_TEMPLATE,
 )
+from tinker_cookbook.recipes.distillation.rl_math_evaluator import RLMathEvaluatorBuilder
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +40,9 @@ class CLIConfig:
     # Model configuration
     model_name: str = "Qwen/Qwen3-8B-Base"  # Student model
     lora_rank: int = 128
-    renderer_name: str | None = None
+    renderer_name: str | None = "qwen3"
     load_checkpoint_path: str | None = None  # Starting checkpoint (e.g., from SFT)
+    load_optimizer_state: bool = True  # If False, only load weights (fresh optimizer)
 
     # Dataset configuration
     group_size: int = 4  # Number of rollouts per prompt
@@ -53,7 +55,7 @@ class CLIConfig:
 
     # Training hyperparameters
     learning_rate: float = 1e-5
-    max_tokens: int = 4096
+    max_tokens: int = 16384
     temperature: float = 1.0
     kl_penalty_coef: float = 1.0
     kl_discount_factor: float = 0.0
@@ -68,8 +70,12 @@ class CLIConfig:
     wandb_name: str | None = None
 
     # Evaluation and checkpointing
-    eval_every: int = 20
-    save_every: int = 20
+    eval_every: int = 50
+    save_every: int = 50
+    infrequent_eval_every: int = 50
+    eval_aime24: bool = False
+    eval_aime25: bool = False
+    max_steps: int | None = None  # If None, train on full dataset
 
     # Service configuration
     base_url: str | None = None
@@ -114,6 +120,34 @@ async def cli_main(cli_config: CLIConfig):
         seed=cli_config.seed,
     )
 
+    # Build infrequent evaluators (AIME24, AIME25)
+    infrequent_evaluator_builders = []
+    if cli_config.eval_aime24:
+        infrequent_evaluator_builders.append(
+            RLMathEvaluatorBuilder(
+                dataset_name="Maxwell-Jia/AIME_2024",
+                split="train",
+                temperature=0.6,
+                max_tokens=16384,
+                n_samples=4,
+                renderer_name=renderer_name,
+                model_name=cli_config.model_name,
+            )
+        )
+
+    if cli_config.eval_aime25:
+        infrequent_evaluator_builders.append(
+            RLMathEvaluatorBuilder(
+                dataset_name="math-ai/aime25",
+                split="test",
+                temperature=0.6,
+                max_tokens=16384,
+                n_samples=4,
+                renderer_name=renderer_name,
+                model_name=cli_config.model_name,
+            )
+        )
+
     # Create full config
     config = train_self_distillation.Config(
         learning_rate=cli_config.learning_rate,
@@ -131,8 +165,12 @@ async def cli_main(cli_config: CLIConfig):
         log_path=log_path,
         base_url=cli_config.base_url,
         load_checkpoint_path=cli_config.load_checkpoint_path,
+        load_optimizer_state=cli_config.load_optimizer_state,
         eval_every=cli_config.eval_every,
         save_every=cli_config.save_every,
+        infrequent_eval_every=cli_config.infrequent_eval_every,
+        infrequent_evaluator_builders=infrequent_evaluator_builders,
+        max_steps=cli_config.max_steps,
     )
 
     cli_utils.check_log_dir(log_path, behavior_if_exists=cli_config.behavior_if_log_dir_exists)

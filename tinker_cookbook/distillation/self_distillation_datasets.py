@@ -27,14 +27,13 @@ from tinker_cookbook.recipes.math_rl.math_grading import extract_boxed
 
 
 # Default prompt templates
-DEFAULT_STUDENT_SUFFIX = "\nWrite your answer in \\boxed{} format."
+DEFAULT_STUDENT_SUFFIX = " Write your answer in \\boxed{} format."
 
 DEFAULT_PROXY_TEACHER_TEMPLATE = """Question: {problem}
 Ground Truth Answer: {answer}
 
 Instruction: You are an expert tutor who knows the final answer provided above. Your goal is to generate a valid, step-by-step derivation that logically leads to the result. Write the solution as if you are solving it from scratch. Do not simply state the ground truth answer at the start. Do not mention that you were provided the answer in your output text. Just produce the reasoning trace.
-
-Output the full reasoning and summarized answer. Write your final answer in \\boxed{} format.
+Output the full reasoning and summarized answer now.
 """
 
 
