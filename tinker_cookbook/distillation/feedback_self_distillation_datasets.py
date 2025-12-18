@@ -92,11 +92,13 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
     """
     Environment for feedback-based self-distillation with two-step generation:
     
-    Step 1: Generate until max_tokens (controlled by cfg.max_tokens in training)
-    Step 2: If </think> not found, append think_continuation_text and continue
+    Step 1: Generate thinking until </think> token (stop sequence)
+    Step 2: Generate the answer until EOS
+            - If </think> was found in step 1: continue from step 1 tokens
+            - If </think> was NOT found: append continuation text then continue
     
-    Following the multi-turn RL pattern, the step() method returns episode_done=False
-    to continue generation if </think> is not found in step 1.
+    Following the multi-turn RL pattern, step() always returns episode_done=False
+    after step 1 to proceed to step 2 for answer generation.
     
     The environment returns zero reward since training signal comes from KL only.
     """
@@ -136,21 +138,21 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         """Returns the student prompt (just the problem + suffix)."""
         return self.problem + self.student_prompt_suffix
 
-    def _get_step1_stop_condition(self) -> list[str]:
+    def _get_step1_stop_condition(self) -> list[int]:
         """
-        Stop condition for step 1: empty list (no early stopping).
-        Generation will stop only when max_tokens is reached (cfg.max_tokens in training).
+        Stop condition for step 1: </think> token.
+        Generation will stop when </think> is generated or max_tokens is reached.
         """
-        return self.renderer.get_stop_sequences()  # No stop sequences for step 1 - rely on max_tokens
+        return self.tokenizer.encode(THINK_END_TOKEN, add_special_tokens=False)
 
-    def _get_step2_stop_condition(self) -> list[str]:
-        """Stop condition for step 2: use renderer's stop sequences."""
+    def _get_step2_stop_condition(self) -> list[int]:
+        """Stop condition for step 2: use renderer's stop sequences (EOS token)."""
         return self.renderer.get_stop_sequences()
 
-    async def initial_observation(self) -> tuple[tinker.ModelInput, list[str]]:
+    async def initial_observation(self) -> tuple[tinker.ModelInput, list[int]]:
         """
-        Returns initial observation for step 1 with no stop sequences.
-        Step 1 relies on cfg.max_tokens for stopping.
+        Returns initial observation for step 1 with </think> as stop sequence.
+        Step 1 generates thinking and stops at </think> or max_tokens.
         """
         convo = self.convo_prefix + [
             {"role": "user", "content": self.get_question()},
@@ -200,10 +202,10 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         """
         Two-step generation logic following multi-turn RL pattern:
         
-        Step 1: Check if </think> is in the generated text
-                - If found: episode_done=True
-                - If not found: episode_done=False, append continuation text
-        Step 2: Always episode_done=True
+        Step 1: Generate thinking (stops at </think> or max_tokens)
+                - If </think> found: proceed to step 2 with current context
+                - If </think> NOT found: proceed to step 2 with continuation text appended
+        Step 2: Generate answer (stops at EOS), always episode_done=True
         """
         self._step_count += 1
         message, parse_success = self.renderer.parse_response(action)
@@ -211,29 +213,32 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
         
         if self._step_count == 1:
             # Step 1: Check for </think> token
-            self._step1_action_tokens = list(action)  # Store for potential step 2
+            self._step1_action_tokens = list(action)  # Store for step 2
+            assert self._initial_observation is not None, "initial_observation must be called first"
             
             if THINK_END_TOKEN in response_text:
-                # </think> found - generation complete in step 1
-                logger.debug(f"</think> found in step 1 after {len(action)} tokens")
+                # </think> found - thinking complete, proceed to step 2 for answer generation
+                logger.debug(f"</think> found in step 1 after {len(action)} tokens, proceeding to step 2")
+                
+                # Build observation for step 2: original prompt + step 1 tokens
+                full_prompt_tokens = self._initial_observation.to_ints() + self._step1_action_tokens
+                next_observation = tinker.ModelInput.from_ints(full_prompt_tokens)
+                
                 return StepResult(
                     reward=0.0,
-                    episode_done=True,
-                    next_observation=tinker.ModelInput.empty(),
+                    episode_done=False,
+                    next_observation=next_observation,
                     next_stop_condition=self._get_step2_stop_condition(),
-                    metrics={"two_step_needed": 0.0},
+                    metrics={},
                 )
             else:
-                # </think> not found - continue with step 2
-                logger.debug(f"</think> NOT found after {len(action)} tokens, continuing to step 2...")
+                # </think> not found - append continuation text, then proceed to step 2
+                logger.debug(f"</think> NOT found after {len(action)} tokens, appending continuation and proceeding to step 2")
                 
-                # Build continuation observation: original prompt + step1 tokens + continuation text
+                # Build observation: original prompt + step 1 tokens + continuation text
                 continuation_tokens = self.tokenizer.encode(
                     self.think_continuation_text, add_special_tokens=False
                 )
-                
-                # Create observation for step 2
-                assert self._initial_observation is not None, "initial_observation must be called first"
                 full_prompt_tokens = (
                     self._initial_observation.to_ints() 
                     + self._step1_action_tokens 
@@ -243,20 +248,20 @@ class FeedbackSelfDistillationEnv(ProblemEnv):
                 
                 return StepResult(
                     reward=0.0,
-                    episode_done=False,  # Continue to step 2
+                    episode_done=False,
                     next_observation=next_observation,
                     next_stop_condition=self._get_step2_stop_condition(),
-                    metrics={"two_step_needed": 1.0},
+                    metrics={},
                 )
         else:
-            # Step 2: Always done
+            # Step 2: Answer generation complete
             logger.debug(f"Step 2 complete with {len(action)} additional tokens")
             return StepResult(
                 reward=0.0,
                 episode_done=True,
                 next_observation=tinker.ModelInput.empty(),
                 next_stop_condition=self._get_step2_stop_condition(),
-                metrics={"two_step_needed": 1.0},
+                metrics={},
             )
 
 
